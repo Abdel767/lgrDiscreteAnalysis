@@ -2,15 +2,9 @@
 library(tidyverse)
 library(janitor)
 
-
-
 # OPTIONS---------------
 # run options(op) at end of script to restore defaults
 op <- options(digits.secs = 3) # accommodate 3 decimal places in seconds of time stamp
-
-
-
-
 
 
 # LOAD DATA------------
@@ -82,16 +76,13 @@ map(dat, ~{
   
 
 
-
-
-
 # INTEGRATE AREA UNDER CURVE------------  
 # This can be done several ways. 
 
 # 1. STATS::INTEGRATE
 # This first approach uses stats::integrate. This function provides error estimate
 # 
-area_integrate <- 
+area_integrate1 <- 
   # map applies function to each list element
   map_df(dat, ~{ # map_df returns data frame
     # apply stats::integrate to each injection x variable combination. Temporarily
@@ -99,7 +90,9 @@ area_integrate <-
     integrate_object <- integrate( # integrate requires a function to integrate over
       approxfun(.x$time_seconds, .x$value), # this creates a function that fits the data
       min(.x$time_seconds), # integrate from
-      max(.x$time_seconds)) # integrate to
+      max(.x$time_seconds),
+      subdivisions = 1000
+      ) # try 1000 or even 5000 # integrate to
     
     # integrate_object is a list. extract the pieces we want
     area <- integrate_object[[1]] # calculated area under the curve
@@ -181,8 +174,85 @@ map(area_auc_plots, ~{print(.x)
   readline("Press Enter to continue")})
 
 # 5. WRITE RESULTS TO DISK
-write.csv(area, file = "output/areas_peaks.csv") #creates a file with the name of the sample and the areas of the peaks
-
+write.csv(area, file = "output/areas_peaks_standards.csv") #creates a file with the name of the sample and the areas of the peaks
 
 # restore default options
 options(op)
+
+# ----------------------
+# CALIBRATION AND PLOTTING
+# ----------------------
+
+# Load calibration data (file with columns that include CH4 and CO2 concentrations)
+calibration <- readr::read_csv("gga_discrete_analysis_calibration_metadata.csv") %>%
+  clean_names() %>%
+  rename_with(~ "ch4_ppm", .cols = matches("ch4")) %>%
+  rename_with(~ "co2_ppm", .cols = matches("co2")) %>%
+  distinct(name, .keep_all = TRUE)
+
+
+# Load standard peak areas and incubation peak areas
+standard_area <- readr::read_csv("areas_peaks_standards.csv") %>%
+  clean_names()
+
+incubation_area <- readr::read_csv("AAJ_peaks_incubations.csv") %>%
+  clean_names()
+
+# Join calibration concentrations to area data for standard injections
+std_data <- standard_area %>%
+  filter(name %in% calibration$name,
+         variable %in% c("ch4_ppm", "co2_ppm")) %>%
+  left_join(calibration, by = "name") %>%
+  mutate(concentration = case_when(
+    variable == "ch4_ppm" ~ ch4_ppm,
+    variable == "co2_ppm" ~ co2_ppm,
+    TRUE ~ NA_real_
+  ))
+
+# Fit linear model for each gas
+standard_models <- std_data %>%
+  group_by(variable) %>%
+  summarise(model = list(lm(concentration ~ area_auc, data = .)), .groups = "drop")
+
+# Merge methane calibration data with peak areas
+methane_cal <- standard_area %>%
+  filter(variable == "ch4_ppm") %>%
+  left_join(calibration %>% select(name, ch4_ppm = matches("ch4")), by = "name")
+
+# Plot the calibration curve
+ggplot(methane_cal, aes(x = area_auc, y = ch4_ppm)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  labs(
+    title = "Methane Calibration Curve",
+    x = "Area Under Curve (AUC)",
+    y = "Methane Concentration (ppm)"
+  ) +
+  theme_bw()
+
+# Apply the models to incubation sample peaks
+incubation_data <- incubation_area %>%
+  filter(variable %in% c("ch4_ppm", "co2_ppm", "ch4_d_ppm", "co2_d_ppm")) %>%
+  mutate(
+    variable = recode(variable,
+                      "ch4_d_ppm" = "ch4_ppm",
+                      "co2_d_ppm" = "co2_ppm")
+  ) %>%
+  left_join(standard_models, by = "variable") %>%
+  mutate(
+    concentration = purrr::map2_dbl(model, area_auc,
+                                    ~predict(.x, newdata = tibble(area_auc = .y))),
+    bottle_id = stringr::str_extract(name, "[A-Z]$"),       # Extract last letter
+    day = as.integer(stringr::str_extract(name, "(?<=SB-)[0-9]+"))  # Extract numeric day
+  )
+
+# Plot CH4 and CO2 concentration vs incubation day per bottle
+incubation_plot <- incubation_data %>%
+  ggplot(aes(x = day, y = concentration, color = variable)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~bottle_id, scales = "free_y") +
+  labs(x = "Incubation Day", y = "Concentration (ppm)", title = "CH₄ and CO₂ over Incubation Time") +
+  theme_bw()
+
+# Plot CH4 rates vs incubation day per bottle (Rates are missing)
